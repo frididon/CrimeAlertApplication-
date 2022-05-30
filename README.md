@@ -1,6 +1,7 @@
 # CrimeAlertApplication
 
-''' Accept crime related data
+```
+Accept crime related data
 
 Approve crime reports
 
@@ -11,4 +12,4 @@ Generate crime data report
 Notify users about confirmed crimes 
 ```
 
-#### Aplication is compile of three sides , mobile , prediction application and admin side for the mobile application . 
+###### Aplication is compile of three sides , mobile , prediction application and admin side for the mobile application . 

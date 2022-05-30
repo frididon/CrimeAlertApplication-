@@ -1,11 +1,4 @@
-# CrimeAlert
-
-A new Flutter project.
-
-## Getting Started
-
-FlutterFlow projects are built to run on the Flutter _stable_ release.
-
+# CrimeAlert 
 ### IMPORTANT:
 
 For projects with Firestore integration, you must first run the following commands to ensure the project compiles:
@@ -14,4 +7,5 @@ For projects with Firestore integration, you must first run the following comman
 flutter pub get
 flutter packages pub run build_runner build --delete-conflicting-outputs
 ```
-
+<sub> These commands will create a bulid for the flutter applications to run. </sub>
+After build is created , use web/application launch to access reports database , by selecting web button , work in progress.

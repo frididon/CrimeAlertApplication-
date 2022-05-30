@@ -1,7 +1,7 @@
 # CrimeAlertApplication
 
 ```
-- [x] Accept crime related data
+[x] Accept crime related data
 
 - [x] Approve crime reports
 

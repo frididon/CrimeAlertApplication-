@@ -1,0 +1,422 @@
+---
+title: "Untitled"
+author: '620128064'
+date: "5/13/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(Hmisc)
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+library(stringr)
+library(lubridate)
+library(tidyverse) 
+library(caret)
+library(ranger)
+library(forcats)
+library(stringr)
+library(pROC)
+library(gbm)
+library(scales)
+
+```
+
+
+##Read information from dataset into dataframe
+```{r}
+crimeStat <- read_csv("/Users/sam/Downloads/atlcrime.csv")
+
+##Create tables for data visualization, save table as text file for use when doing shiny application
+table(crimeStat$crime)
+x <- table(crimeStat$neighborhood)
+write.table(x, file = "x.txt", sep = ",", quote = TRUE, row.names = F)
+```
+
+##Group the dataset by date, neighbourhood and crime and then calculate a count feature for occurence of crimes, add this column to dataset.
+```{r}
+crimeStat <- crimeStat %>% 
+  group_by(date,  neighborhood, crime) %>% 
+  dplyr::summarize(dailycount = n()) %>% 
+  ungroup()
+```
+
+##Get the month, date, year and day of the week from each date, then add them into new columns with the respective names. Mutate these columns to a new dataframe, along with all previous columns. 
+```{r}
+crimeDaily <- crimeStat %>% 
+  mutate(date = mdy(date), Month = month(date), Year = year(date),
+         day = day(date),  
+         weekday = weekdays(date, abbreviate=T), week = week(date)) %>% 
+  mutate(weekday = factor(weekday, levels = c("Mon","Tue","Wed","Thu","Fri","Sat","Sun")))
+names(crimeDaily)[1]='Date'
+```
+
+##Conduct a graphical visualization to see the amount of crimes per month.
+```{r}
+crimeDaily %>% 
+  group_by(Month, crime) %>% 
+  dplyr::summarize(count = sum(dailycount)) %>% 
+  ggplot(aes(x = Month, y = count, col = crime)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(.~crime, scales = 'free_y') + scale_x_continuous(breaks= pretty_breaks()) 
+```
+
+##Conduct graphical visualization to see the crime count per month
+```{r}
+  c <- crimeDaily %>% 
+  group_by(Month, crime) %>% 
+  dplyr::summarize(dailycount = sum(dailycount)) 
+  ggplot(data = c, aes(x = Month, y = dailycount, col = crime)) + geom_point() + geom_line() +
+    scale_x_continuous(breaks= pretty_breaks()) + ggtitle("Crimes per Month")
+```
+
+##Conduct graphical analysis to see the total crime counts per neighbourhood. Since there are 200+ neighbourhoods in dataset, provide a filter to see the most dangerous neighbourhoods.
+```{r}
+  crimeDaily %>% 
+  group_by(neighborhood) %>%
+  filter(neighborhood != "NA") %>%
+  dplyr::summarize(total_count = sum(dailycount)) %>% 
+  arrange(desc(total_count)) %>% 
+  filter(total_count > 3967) %>% 
+  ggplot(aes(x = fct_reorder(neighborhood, total_count), y = total_count)) +
+  geom_bar(stat = 'identity') +coord_flip() +xlab('Neighborhood') +ylab('Total Crime Count') + ggtitle("Total Crime Count per Neighbourhood")
+```
+
+##Divide neighbourhoods into clusters since there are 200+ neighbourhoods in dataset. This would take far too long if fed to the model.
+```{r}
+cN <- crimeStat %>% 
+  group_by(neighborhood,crime) %>% 
+  dplyr::summarize(count = n()) %>% 
+  drop_na() %>% 
+  spread(crime,count,fill = 0) 
+scaled = scale(cN[,2:7]) 
+wss = 0 
+for (i in 1:20) {
+  km.out = kmeans(scaled, centers = i, nstart = 20, iter.max = 50)
+  wss[i] = km.out$tot.withinss
+}
+plot(wss)
+```
+##Use the previous code to divide neighbourhoods into x amount of clusters, in this case we use 10, as that should be sufficient for what we are trying to dob
+```{r}
+km.out = kmeans(scaled, centers = 10, nstart = 20, iter.max = 50)
+cN$cluster = km.out$cluster
+nCluster <- cN %>% 
+  select(neighborhood,cluster) 
+nCluster$cluster = factor(nCluster$cluster)
+```
+
+##Preparing the data to so that count is initialized to 0 if a crime doesnt happen in a particular neighbourhood for a particular date.
+```{r message=FALSE, warning=FALSE}
+neighborhood = unique(crimeDaily$neighborhood[!is.na(crimeDaily$neighborhood)])
+crime = unique(crimeDaily$crime)
+Date = seq(ymd('2012-01-01'),ymd('2019-01-12'), by = '1 day')
+prepare <- expand.grid(Date = Date,neighborhood = neighborhood,crime = crime) %>% 
+  mutate(Month = month(Date), Year = year(Date),
+         Day = day(Date),  
+         Weekday = weekdays(Date, abbreviate=T), Week = week(Date)) %>% 
+  mutate(Weekday = factor(Weekday, levels = c("Mon","Tue","Wed","Thu","Fri","Sat","Sun")))
+crimeDaily <- prepare %>% 
+  left_join(crimeDaily)
+crimeDaily$dailycount[is.na(crimeDaily$dailycount)] = 0
+table(crimeDaily$count)
+proportion = crimeDaily %>% 
+  group_by(crime) %>% 
+  dplyr::summarize(prop = sum(dailycount != 0)/n())
+proportion
+```
+
+##Create a variable indicating a boolean value if crime occurs or not in the different neighbourhoods.
+```{r}
+crimeDaily$crimeoccur = if_else(crimeDaily$dailycount == 0, 'No', 'Yes')
+```
+
+##Convert month and day to factors
+```{r message=FALSE, warning=FALSE}
+crimeDaily0 <- crimeDaily %>% 
+  left_join(nCluster) %>% 
+  mutate(Month = factor(Month), Day = factor(Day))
+```
+##Convert crimeoccur to a factor
+```{r}
+crimeDaily0$crimeoccur = factor(crimeDaily0$crimeoccur, levels = c('Yes','No'))
+```
+
+##Create the train and test datasets to be used by the model. Since the dataset is so vast, we will use a year worth of data to train the model, and dates from 2014 and larger for the testing dataset.
+```{r}
+trainHomicide <- crimeDaily0 %>% filter(Date <ymd(20141001),Date >= ymd(20131001),crime == 'HOMICIDE')
+testHomicide <- crimeDaily0 %>% filter(Date >= ymd(20141001),crime == 'HOMICIDE')
+
+trainAggA <- crimeDaily0 %>% filter(Date <ymd(20141001),Date >= ymd(20131001),crime == 'AGG ASSAULT')
+testAggA <- crimeDaily0 %>% filter(Date >= ymd(20141001),crime == 'AGG ASSAULT')
+
+trainAutoT <- crimeDaily0 %>% filter(Date <ymd(20141001),Date >= ymd(20131001),crime == 'AUTO THEFT')
+testAutoT <- crimeDaily0 %>% filter(Date >= ymd(20141001),crime == 'AUTO THEFT')
+
+trainBur <- crimeDaily0 %>% filter(Date <ymd(20141001),Date >= ymd(20131001),crime == 'BURGLARY-NONRES'| crime == 'BURGLARY-RESIDENCE')
+testBur <- crimeDaily0 %>% filter(Date >= ymd(20141001),crime == 'BURGLARY-NONRES'| crime == 'BURGLARY-RESIDENCE')
+
+trainLar <- crimeDaily0 %>% filter(Date <ymd(20141001),Date >= ymd(20131001),crime ==  'LARCENY-FROM VEHICLE' | crime == 'LARCENY-NON VEHICLE')
+testLar <- crimeDaily0 %>% filter(Date >= ymd(20141001),crime ==  'LARCENY-FROM VEHICLE' | crime == 'LARCENY-NON VEHICLE')
+
+trainRape <- crimeDaily0 %>% filter(Date <ymd(20141001),Date >= ymd(20131001),crime ==  'RAPE')
+testRape <- crimeDaily0 %>% filter(Date >= ymd(20141001),crime == 'RAPE')
+
+
+trainRobbery <- crimeDaily0 %>% filter(Date <ymd(20141001),Date >= ymd(20131001),crime ==  'ROBBERY-COMMERCIAL' | crime == 'ROBBERY-PEDESTRIAN' | crime == 'ROBBERY-RESIDENCE')
+testRobbery <- crimeDaily0 %>% filter(Date >= ymd(20141001),crime ==  'ROBBERY-COMMERCIAL' | crime == 'ROBBERY-PEDESTRIAN' | crime == 'ROBBERY-RESIDENCE')
+```
+
+
+
+```{r}
+glm_model <- glm(as.factor(crimeoccur) ~ neighborhood + Day + Month + Weekday,
+                 data = trainHomicide, family = binomial)
+```
+
+
+```{r}
+set.seed(32)
+myFolds <- createFolds(trainHomicide$crimeoccur, k = 3)
+myControl = trainControl(summaryFunction = twoClassSummary, classProbs = T,verboseIter = T,
+                          savePredictions = F,
+                          index = myFolds, trim = T, returnData = F)
+
+formula_train = as.formula('as.factor(crimeoccur)~ Month + Day + Weekday')
+
+```
+
+##Create model using glmnet algorithm
+```{r}
+model_glmnet <- train(formula_train, trControl = myControl, tuneGrid = expand.grid(alpha = c(0,0.1,1), lambda = c(0,0.5,1)),
+                      method = 'glmnet',metric = 'ROC', data = trainHomicide)
+```
+
+##Visualize results
+```{r}
+plot(model_glmnet)
+print(model_glmnet)
+```
+
+
+##Train model for each crime type
+```{r}
+glmnet_model_homicide = train(crimeoccur ~ cluster + Day + Month + Weekday,
+                     data = trainHomicide,
+                     metric = 'ROC',
+                     method = "glmnet",
+                     tuneGrid = expand.grid(
+                       alpha = 1,
+                       lambda = 0
+                     ),
+                     trControl = myControl)
+```
+
+```{r}
+glmnet_model_aggA = train(crimeoccur ~ cluster + Day + Month + Weekday,
+                              data = trainAggA,
+                              metric = 'ROC',
+                              method = "glmnet",
+                              tuneGrid = expand.grid(
+                                alpha = 1,
+                                lambda = 0
+                              ),
+                              trControl = myControl)
+```
+
+```{r}
+glmnet_model_AutoT = train(crimeoccur ~ cluster + Day + Month + Weekday,
+                             data = trainAutoT,
+                             metric = 'ROC',
+                             method = "glmnet",
+                             tuneGrid = expand.grid(
+                               alpha = 1,
+                               lambda = 0
+                             ),
+                             trControl = myControl)
+```                            
+
+```{r}
+glmnet_model_Bur = train(crimeoccur ~ cluster + Day + Month + Weekday,
+                             data = trainBur,
+                             metric = 'ROC',
+                             method = "glmnet",
+                             tuneGrid = expand.grid(
+                               alpha = 1,
+                               lambda = 0
+                             ),
+                             trControl = myControl)
+```
+
+```{r}
+glmnet_model_Lar = train(crimeoccur ~ cluster + Day + Month + Weekday,
+                             data = trainLar,
+                             metric = 'ROC',
+                             method = "glmnet",
+                             tuneGrid = expand.grid(
+                               alpha = 1,
+                               lambda = 0
+                             ),
+                             trControl = myControl)
+```
+
+```{r}
+glmnet_model_rape = train(crimeoccur ~ cluster + Day + Month + Weekday,
+                             data = trainRape,
+                             metric = 'ROC',
+                             method = "glmnet",
+                             tuneGrid = expand.grid(
+                               alpha = 1,
+                               lambda = 0
+                             ),
+                             trControl = myControl)
+```
+
+```{r}
+glmnet_model_Robbery = train(crimeoccur ~ cluster + Day + Month + Weekday,
+                             data = trainRobbery,
+                             metric = 'ROC',
+                             method = "glmnet",
+                             tuneGrid = expand.grid(
+                               alpha = 1,
+                               lambda = 0
+                             ),
+                             trControl = myControl)
+```
+
+
+##Use generalization to visualize results
+```{r}
+roc_obj <- roc(testHomicide$crimeoccur, predict(glmnet_model_homicide, testHomicide, type = 'prob')$Yes)
+auc(roc_obj)
+```
+
+```{r}
+roc_obj <- roc(testAggA$crimeoccur, predict(glmnet_model_aggA, testAggA, type = 'prob')$Yes)
+auc(roc_obj)
+```
+```{r}
+roc_obj <- roc(testAutoT$crimeoccur, predict(glmnet_model_AutoT, testAutoT, type = 'prob')$Yes)
+auc(roc_obj)
+```
+```{r}
+roc_obj <- roc(testBur$crimeoccur, predict(glmnet_model_Bur, testBur, type = 'prob')$Yes)
+auc(roc_obj)
+plot(roc_obj)
+```
+
+```{r}
+roc_obj <- roc(testRape$crimeoccur, predict(glmnet_model_rape, testRape, type = 'prob')$Yes)
+auc(roc_obj)
+plot(roc_obj)
+```
+```{r}
+roc_obj <- roc(testLar$crimeoccur, predict(glmnet_model_Lar, testLar, type = 'prob')$Yes)
+auc(roc_obj)
+```
+
+```{r}
+roc_obj <- roc(testRobbery$crimeoccur, predict(glmnet_model_Robbery, testRobbery, type = 'prob')$Yes)
+auc(roc_obj)
+```
+
+##Make a random prediction to ensure model is working
+```{r}
+prediction2 <-  predict(glmnet_model_aggA, data.frame(cluster = "6", Day = "17", Month = "2", Weekday = "Mon"), type='prob')
+prediction2$Yes * 100
+```
+
+##Split dataset into locations, to get the lattitude and longitude values of each neighbourhood
+```{r}
+loc <- read_csv("/Users/sam/Downloads/atlcrime.csv")
+locations <- loc %>%
+  group_by(neighborhood,lat,long) %>% 
+  dplyr::summarize(count = n()) %>% 
+  drop_na() 
+```
+
+```{r}
+lattitude <- locations %>%
+  group_by(neighborhood) %>%
+  dplyr::summarize(lat= mean(as.numeric(lat))) 
+```
+
+```{r}
+longitude <- locations %>%
+  group_by(neighborhood) %>%
+  dplyr::summarize(longg = mean(as.numeric(long)))
+```
+
+```{r}
+totalLoc <- lattitude %>%
+  left_join(longitude)
+```
+
+##More visualizations for dataset, to see crimes per month for particular years.
+```{r}
+c2016 <- crimeDaily %>% 
+  group_by(Month, Year, crime) %>% 
+  filter(Year == 2016) %>%
+  dplyr::summarize(dailycount = sum(dailycount)) 
+ggplot(data = c2016, aes(x = Month, y = dailycount, col = crime)) + geom_point() + geom_line() +
+scale_x_continuous(breaks= pretty_breaks()) + ggtitle("Crimes per Month for 2016")
+```
+
+```{r}
+c2015 <- crimeDaily %>% 
+  group_by(Month, Year, crime) %>% 
+  filter(Year == 2015) %>%
+  dplyr::summarize(dailycount = sum(dailycount)) 
+ggplot(data = c2015, aes(x = Month, y = dailycount, col = crime)) + geom_point() + geom_line() +
+scale_x_continuous(breaks= pretty_breaks()) + ggtitle("Crimes per Month for 2015")
+```
+
+```{r}
+c2014 <- crimeDaily %>% 
+  group_by(Month, Year, crime) %>% 
+  filter(Year == 2014) %>%
+  dplyr::summarize(dailycount = sum(dailycount)) 
+ggplot(data = c2014, aes(x = Month, y = dailycount, col = crime)) + geom_point() + geom_line() +
+scale_x_continuous(breaks= pretty_breaks()) + ggtitle("Crimes per Month for 2014")
+```
+
+
+##More visualizations to see the neighbourhoods with the most crime levels for particular years.
+```{r}
+  top2014crimeDaily <- crimeDaily %>% 
+  group_by(neighborhood) %>%
+  dplyr::filter(neighborhood != "NA") %>%
+  dplyr::summarize(total_count = sum(dailycount)) %>%
+  arrange(desc(total_count)) %>% 
+  dplyr::filter(total_count > 4000) 
+```
+
+```{r}
+ top2015crimeDaily <- crimeDaily %>% 
+   group_by(neighborhood)%>%
+    dplyr::filter(Year==2015) %>%
+    dplyr::filter(neighborhood!="NA") %>%
+    dplyr::summarize(total_count = sum(dailycount)) %>%
+    arrange(desc(total_count)) %>% 
+    dplyr::filter(total_count > 700) 
+```
+
+```{r}
+  top2016crimeDaily <- crimeDaily %>% 
+  group_by(neighborhood) %>%
+  dplyr::filter(Year==2016) %>%
+  dplyr::filter(neighborhood != "NA") %>%
+  dplyr::summarize(total_count = sum(dailycount)) %>%
+  arrange(desc(total_count)) %>% 
+  dplyr::filter(total_count > 680) 
+```
+
+```{r}
+ggplot(data = top2014crimeDaily, aes(x = neighborhood, y=total_count))+ geom_bar(stat = 'identity') +coord_flip() +xlab('Neighborhood') +ylab('Total Crime Count') + ggtitle("Total Crime Count per Neighbourhood")
+```
+
+
